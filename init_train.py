@@ -28,7 +28,7 @@ def get_firebase_data():
                 'humidity': float(record['humidity']),
                 'light': float(record['light']),
                 'moisture_before': float(record['moisture_before']),
-                'watering_duration': float(record['predicted_time']),
+                'predicted_time': float(record['predicted_time']),,
                 'moisture_after': float(record['moisture_after'])
             })
         except (KeyError, ValueError) as e:
