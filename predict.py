@@ -39,7 +39,7 @@ def predict_watering(request):
         # Make prediction
         duration = model.predict([features])[0]
         
-        return {"watering_duration": float(duration)}
+        return {"predicted_time": float(duration)}
             # "features_used": expected_features,
             # "status": "success"
         
