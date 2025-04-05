@@ -47,7 +47,7 @@ def train_model(df):
     
     features = ['temperature', 'humidity', 'light', 'moisture_before']
     X = filtered[features]
-    y = filtered['watering_duration']
+    y= filtered['predicted_time']
     
     model = RandomForestRegressor(
         n_estimators=150,
