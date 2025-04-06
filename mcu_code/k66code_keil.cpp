@@ -1,5 +1,6 @@
 #include "mbed.h"
 #include <cstring>
+using namespace std::chrono;
 
 // Blinking rate in milliseconds
 #define BLINKING_RATE 500ms
@@ -11,8 +12,9 @@ Mutex soilMoistureMutex;
 
 Thread send_data_thread;
 Thread read_data_thread;
+Mutex sendStateMutex;
 //Thread pump_control_thread;
-
+volatile bool canSendData = true;
 
 // I2C interface for sensors
 I2C i2c1(PTC11, PTC10);
@@ -24,6 +26,8 @@ const int SHTC3_ADDR = 0x70 << 1;   // SHTC3 (Temperature & Humidity Sensor)
 // Analog input for Soil Moisture Sensor
 AnalogIn soilSensor(PTB7);
 DigitalOut led(LED1);
+DigitalOut fanLED(PTC8);    // LED for fan
+DigitalOut lightLED(PTC16);  // LED for light
 
 //Relay
 // Digital output for relay control (PTA1 or any available pin)
@@ -88,117 +92,134 @@ void readSHTC3(float &temperature, float &humidity) {
     //printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
 }
 
-// Function to control the relay (turn on/off pump based on soil moisture)
-// void controlPump() {
-//     while (true) {
-//         float soilCurrentMoisture = readSoilMoisture();
-
-//         if (soilCurrentMoisture < SOIL_MOISTURE_THRESHOLD) {
-//             // If soil moisture is below threshold, turn on the pump (activate relay)
-//             relayControl = 0;
-//             printf("Pump ON\n");
-//         } else {
-//             // Otherwise, turn off the pump (deactivate relay)
-//             relayControl = 1;
-//             printf("Pump OFF\n");
-//         }
-
-//         ThisThread::sleep_for(1s);  // Check every second
-//     }
-// }
 
 // Function to send **real sensor data** to ESP32 in JSON format
 void send_data() {
     while (true) {
+        sendStateMutex.lock();
+        bool send = canSendData;
+        sendStateMutex.unlock();
+        if(send) {
+
         float temperature, humidity;
         float soilMoisture = readSoilMoisture();
         float lightIntensity = readLightIntensity();
         readSHTC3(temperature, humidity);
         // Format sensor data in JSON
         char jsonData[128];
-        sprintf(jsonData,
-                "{\"temperature\": %.2f, \"humidity\": %.2f, \"moisture\": %.2f, \"light\": %.2f}\n",
-                temperature, humidity, soilMoisture, lightIntensity);
+        int len = sprintf(jsonData,
+            "{\"temperature\": %.2f, \"humidity\": %.2f, \"moisture\": %.2f, \"light\": %.2f}#\n",
+            temperature, humidity, soilMoisture, lightIntensity);
 
         //Send data via UART to ESP32
         serial_port_mutex.lock();
-        serial_port.write(jsonData, strlen(jsonData));
+        serial_port.write(jsonData, len);
+        serial_port.sync();  // Wait until data is flushed
         serial_port_mutex.unlock();
+        printf("Sent JSON: %s\n", jsonData);
+        }
+        ThisThread::sleep_for(300ms);
 
-        //printf("Sent JSON: %s\n", jsonData);
-        ThisThread::sleep_for(1s);
+    }
+}
+void processCommandFromESP(const char* buffer, uint64_t currentTime, uint64_t &pumpStopTime, bool &pumpRunning) {
+    // Handle watering command
+    const char *waterCmd = strstr(buffer, "\"water_duration\"");
+    if (waterCmd) {
+        float duration = 0;
+        if (sscanf(waterCmd, "\"water_duration\": %f", &duration) == 1) {
+            printf("Parsed watering_duration: %.2f seconds\n", duration);
+
+            sendStateMutex.lock();
+            canSendData = false;
+            sendStateMutex.unlock();
+
+            if (duration > 0) {
+                pumpStopTime = currentTime + (uint64_t)(duration * 1e6);
+                relayControl = 0;
+                pumpRunning = true;
+                printf("Pump started\n");
+            } else {
+                relayControl = 1;
+                sendStateMutex.lock();
+                canSendData = true;
+                sendStateMutex.unlock();
+                pumpRunning = false;
+                printf("No watering needed (0 duration)\n");
+            }
+        }
+    }
+
+    // Handle fan/light control
+    if (strstr(buffer, "\"fan\": \"on\"")) {
+        fanLED = 1;
+        printf("Fan ON\n");
+    } else if (strstr(buffer, "\"fan\": \"off\"")) {
+        fanLED = 0;
+        printf("Fan OFF\n");
+    }
+
+    if (strstr(buffer, "\"light\": \"on\"")) {
+        lightLED = 1;
+        printf("Light ON\n");
+    } else if (strstr(buffer, "\"light\": \"off\"")) {
+        lightLED = 0;
+        printf("Light OFF\n");
+    }
+
+}
+
+void handleIncomingSerialData(char* buffer, int &index, uint64_t currentTime, uint64_t &pumpStopTime, bool &pumpRunning) {
+    char c;
+    while (serial_port.readable() && serial_port.read(&c, 1)) {
+        if (c == '\n') {
+            buffer[index] = '\0';  // Null-terminate string
+            printf("Received from ESP32: %s\n", buffer);
+            processCommandFromESP(buffer, currentTime, pumpStopTime, pumpRunning);
+            index = 0;  // Reset buffer
+        } else {
+            if (index < 127) {
+                buffer[index++] = c;
+            }
+        }
     }
 }
 
-// Function to read data from ESP32 (for future use)
+void checkPumpStopCondition(uint64_t currentTime, uint64_t &pumpStopTime, bool &pumpRunning) {
+    if (pumpRunning && currentTime >= pumpStopTime) {
+        relayControl = 1;  // Turn OFF relay
+        sendStateMutex.lock();
+        canSendData = true;
+        sendStateMutex.unlock();
+        pumpRunning = false;
+        printf("Pump stopped after scheduled duration\n");
+    }
+}
+
+void debugPumpStatus(uint64_t currentTime, uint64_t pumpStopTime, bool pumpRunning) {
+    static uint64_t lastDebugTime = 0;
+    if (currentTime - lastDebugTime > 5000000) {
+        if (pumpRunning) {
+            printf("DEBUG: Pump is ON, will stop in %.2f seconds\n",
+                   (float)(pumpStopTime - currentTime) / 1e6);
+        }
+        lastDebugTime = currentTime;
+    }
+}
+
 void read_data() {
     char buffer[128];
     int index = 0;
-    
-    // Variables for pump control
-    uint64_t pumpStopTime = 0;  // Time when pump should stop (in microseconds)
+    uint64_t pumpStopTime = 0;
     bool pumpRunning = false;
-    relayControl = 1;  // Relay OFF initially (Active Low = 0)
+    relayControl = 1;  // OFF initially (Active Low)
 
     while (true) {
-        // Check current time for pump control
-        uint64_t currentTime = Kernel::get_ms_count() * 1000;  // Current time in microseconds
-        
-        // Check for incoming data
-        char c;
-        while (serial_port.readable() && serial_port.read(&c, 1)) {
-            if (c == '\n') {
-                buffer[index] = '\0';  // Terminate string
-                printf("Received from ESP32: %s\n", buffer);
+        uint64_t currentTime = duration_cast<microseconds>(Kernel::Clock::now().time_since_epoch()).count();
 
-                // Parse for "water_duration"
-                char *start = strstr(buffer, "\"water_duration\"");
-                if (start) {
-                    float duration = 0;
-                    if (sscanf(start, "\"water_duration\": %f", &duration) == 1) {
-                        printf("Parsed watering_duration: %.2f seconds\n", duration);
-
-                        if (duration > 0) {
-                            // Calculate absolute stop time
-                            pumpStopTime = currentTime + (uint64_t)(duration * 1e6);
-                            
-                            // Turn on pump
-                            relayControl = 0;  // Turn ON relay (Active Low)
-                            pumpRunning = true;
-                            printf("Pump started\n");
-                        } else {
-                            // No watering needed
-                            relayControl = 1;  // Turn OFF relay
-                            pumpRunning = false;
-                            printf("No watering needed (0 duration)\n");
-                        }
-                    }
-                }
-
-                index = 0;  // Reset buffer
-            } else {
-                if (index < sizeof(buffer) - 1) {
-                    buffer[index++] = c;
-                }
-            }
-        }
-
-        // Check if it's time to stop the pump
-        if (pumpRunning && currentTime >= pumpStopTime) {
-            relayControl = 1;  // Turn OFF relay
-            pumpRunning = false;
-            printf("Pump stopped after scheduled duration\n");
-        }
-
-        // Add a debugging check to output pump status periodically
-        static uint64_t lastDebugTime = 0;
-        if (currentTime - lastDebugTime > 5000000) {  // Debug every 5 seconds
-            if (pumpRunning) {
-                printf("DEBUG: Pump is ON, will stop in %.2f seconds\n", 
-                       (float)(pumpStopTime - currentTime) / 1e6);
-            }
-            lastDebugTime = currentTime;
-        }
+        handleIncomingSerialData(buffer, index, currentTime, pumpStopTime, pumpRunning);
+        checkPumpStopCondition(currentTime, pumpStopTime, pumpRunning);
+        debugPumpStatus(currentTime, pumpStopTime, pumpRunning);
 
         ThisThread::sleep_for(20ms);
     }
@@ -210,7 +231,6 @@ int main() {
     initSHTC3();        // Initialize SHTC3 sensor
     send_data_thread.start(send_data);
     read_data_thread.start(read_data);
-    //pump_control_thread.start(controlPump);  // Start pump control thread
 
     while (1) {
         ThisThread::sleep_for(BLINKING_RATE);

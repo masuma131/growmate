@@ -2,15 +2,15 @@
 #include <HTTPClient.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#define FIREBASE_SECRET "YOUR_FIREBASE_SECRET" // Replace with your Firebase secret
+#define FIREBASE_SECRET "FIREBASE SECRET"
 
 // Set this manually based on season
 // -14400 = UTC -4 (EDT), -18000 = UTC -5 (EST)
-#define TIMEZONE_OFFSET -14400  
+#define TIMEZONE_OFFSET -14400  // change to -18000 when DST ends
 
-const char *ssid = "YOUR_WIFI_SSID"; // Replace with your WiFi SSID
-const char *password = "YOUR_WIFI_PASSWORD"; // Replace with your WiFi password
-const char *firebase_url = "YOUR_FIREBASE_URL"; // Replace with your Firebase URL
+const char *ssid = "Ihitilan";
+const char *password = "Medhurst78";
+const char *firebase_url = "FIREBASE_URL";
 const char *predict_url = "https://us-central1-growmate-455421.cloudfunctions.net/predict_watering";
 
 WiFiServer server(80);
@@ -26,6 +26,7 @@ NTPClient timeClient(ntpUDP, "time.nist.gov", TIMEZONE_OFFSET, 60000);
 const int fanPin = 12;
 const int lightPin = 14;
 
+bool autoWateringEnabled = true; // Controls whether watering logic runs automatically
 
 unsigned long lastDataUpdate = 0;  //Track last update
 String lastTimestamp = "";
@@ -112,6 +113,7 @@ float callAIPrediction(float temp, float humidity, float light, float moisture_b
     jsonPayload += "}";
 
     int httpCode = http.POST(jsonPayload);
+    
     float duration = 0;
     if (httpCode == 200) {
       String response = http.getString();
@@ -137,146 +139,159 @@ void logToFirebase(String path, String jsonData, bool patch = false) {
   Serial.println(code == 200 ? "Logged to Firebase!" : "Firebase log error: " + String(code));
   http.end();
 }
+
 void handleClient() {
-  WiFiClient client = server.available();  // non-blocking check for clients
+  WiFiClient client = server.available();
 
   if (client) {
-    unsigned long clientTimeout = millis() + 5000; // 5 second timeout
+    unsigned long clientTimeout = millis() + 5000;
     String currentLine = "";
-    
-    // Process client request with timeout
+    String request = "";
+
     while (client.connected() && millis() < clientTimeout) {
       if (client.available()) {
         char c = client.read();
-        
-        if (c == '\n') {
-          if (currentLine.length() == 0) {
-            // Send HTTP response
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-type:text/html");
+        request += c;
+
+        if (c == '\n' && currentLine.length() == 0) {
+          String requestLine = request.substring(0, request.indexOf('\r'));
+
+          // Handle toggles with redirects
+          if (requestLine.startsWith("GET /toggleAutoWatering")) {
+            autoWateringEnabled = !autoWateringEnabled;
+            client.println("HTTP/1.1 303 See Other");
+            client.println("Location: /");
             client.println();
-
-            client.println("<!DOCTYPE html><html><head><meta http-equiv='refresh' content='5'><title>ESP32 Sensor Dashboard</title></head><body>");
-            client.println("<h2>GrowMate Dashboard</h2>");
-            client.print("<p><strong>Current state:</strong> ");
-
-            switch(currentState) {
-              case IDLE: client.print("IDLE"); break;
-              case WATERING: client.print("WATERING"); break;
-              case WAITING_FOR_FINAL_READING: client.print("WAITING FOR FINAL READING"); break;
-            }
-            client.println("</p>");
-
-            client.println("<h3>Latest Sensor Readings</h3>");
-            client.println("<table border='1' cellpadding='8'><tr><th>Temperature (°C)</th><th>Humidity (%)</th><th>Moisture</th><th>Light</th></tr>");
-            client.print("<tr><td>" + String(temperature) + "</td><td>" + String(humidity) + "</td><td>" + String(moisture) + "</td><td>" + String(light) + "</td></tr></table>");
-
-            client.println("<br><strong>Last Timestamp:</strong> " + lastTimestamp + "<br>");
-            client.println("<strong>Predicted Watering Time:</strong> " + String(predictedTime) + " sec<br>");
-
-            // Links for controlling LED, Fan, and Light
-            client.println("<br><a href=\"/H\">Turn LED ON</a><br>");
-            client.println("<a href=\"/L\">Turn LED OFF</a><br>");
-            client.println("<br><a href=\"/FanOn\">Turn Fan ON</a><br>");
-            client.println("<a href=\"/FanOff\">Turn Fan OFF</a><br>");
-            client.println("<br><a href=\"/LightOn\">Turn Light ON</a><br>");
-            client.println("<a href=\"/LightOff\">Turn Light OFF</a><br>");
-            client.println("<br><em>Page auto-refreshes every 5 seconds.</em>");
-            client.println("</body></html>");
-
-            client.println();
-            break;
-          } else {
-            currentLine = "";
+            return;
           }
-        } else if (c != '\r') {
-          currentLine += c;
+
+          if (requestLine.startsWith("GET /toggleFan")) {
+            digitalWrite(fanPin, !digitalRead(fanPin));
+            Serial2.print(digitalRead(fanPin) ? "{\"fan\": \"on\"}\n" : "{\"fan\": \"off\"}\n");
+            client.println("HTTP/1.1 303 See Other");
+            client.println("Location: /");
+            client.println();
+            return;
+          }
+
+          if (requestLine.startsWith("GET /toggleLight")) {
+            digitalWrite(lightPin, !digitalRead(lightPin));
+            Serial2.print(digitalRead(lightPin) ? "{\"light\": \"on\"}\n" : "{\"light\": \"off\"}\n");
+            client.println("HTTP/1.1 303 See Other");
+            client.println("Location: /");
+            client.println();
+            return;
+          }
+
+          // Main dashboard page
+          client.println("HTTP/1.1 200 OK");
+          client.println("Content-type:text/html\r\n");
+          client.println("<!DOCTYPE html><html><head><title>GrowMate Dashboard</title><meta http-equiv='refresh' content='5'>");
+          client.println("<style>");
+          client.println("body { font-family: sans-serif; background: #eef2f3; padding: 15px; }");
+          client.println("h2 { color: #2E8B57; }");
+          client.println(".section { background: white; border-radius: 10px; padding: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); margin-bottom: 15px; }");
+          client.println("table { width: 100%; border-collapse: collapse; margin-top: 10px; }");
+          client.println("th, td { padding: 10px; text-align: center; border: 1px solid #ccc; }");
+          client.println(".toggle { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; }");
+          client.println(".toggle a { padding: 10px 20px; border-radius: 30px; background: #4CAF50; color: white; text-decoration: none; font-weight: bold; }");
+          client.println(".toggle span { font-weight: bold; }");
+          client.println("</style></head><body>");
+
+          client.println("<h2>GrowMate Dashboard</h2>");
+
+          // System status
+          client.println("<div class='section'><p><strong>Current State:</strong> ");
+          switch (currentState) {
+            case IDLE: client.print("IDLE"); break;
+            case WATERING: client.print("WATERING"); break;
+            case WAITING_FOR_FINAL_READING: client.print("WAITING FOR FINAL READING"); break;
+          }
+          client.println("</p><p><strong>Last Timestamp:</strong> " + lastTimestamp + "</p>");
+          client.println("<p><strong>Predicted Watering Time:</strong> " + String(predictedTime) + " seconds</p></div>");
+
+          // Sensor Data
+          client.println("<div class='section'><h3>Sensor Readings</h3>");
+          client.println("<table><tr><th>Temperature (&deg;C)</th><th>Humidity (%)</th><th>Moisture</th><th>Light</th></tr>");
+          client.println("<tr><td>" + String(temperature) + "</td><td>" + String(humidity) + "</td><td>" + String(moisture) + "</td><td>" + String(light) + "</td></tr></table></div>");
+
+          // Controls
+          client.println("<div class='section'><h3>Device Controls</h3>");
+          // Fan status
+          String fanStatus = digitalRead(fanPin) ? "<span style='color:green;font-weight:bold;'>ON</span>" : "<span style='color:red;font-weight:bold;'>OFF</span>";
+          client.println("<div class='toggle'><span>Fan: " + fanStatus + "</span><a href='/toggleFan'>" + String(digitalRead(fanPin) ? "Turn OFF" : "Turn ON") + "</a></div>");
+
+          // Light status
+          String lightStatus = digitalRead(lightPin) ? "<span style='color:green;font-weight:bold;'>ON</span>" : "<span style='color:red;font-weight:bold;'>OFF</span>";
+          client.println("<div class='toggle'><span>Light: " + lightStatus + "</span><a href='/toggleLight'>" + String(digitalRead(lightPin) ? "Turn OFF" : "Turn ON") + "</a></div>");
+
+          // Auto-Watering status (already handled similarly)
+          String autoStatus = autoWateringEnabled ? "<span style='color:green;font-weight:bold;'>ON</span>" : "<span style='color:red;font-weight:bold;'>OFF</span>";
+          client.println("<div class='toggle'><span>Auto-Watering: " + autoStatus + "</span><a href='/toggleAutoWatering'>" + String(autoWateringEnabled ? "Turn OFF" : "Turn ON") + "</a></div>");
+
+          client.println("</div>");
+
+          client.println("<p><em>Page auto-refreshes every 5 seconds.</em></p>");
+          client.println("</body></html>");
+          break;
         }
 
-        // Test: LED control
-        if (currentLine.endsWith("GET /H")) {
-          digitalWrite(2, HIGH);  // LED ON
-        }
-        if (currentLine.endsWith("GET /L")) {
-          digitalWrite(2, LOW);   // LED OFF
-        }
-
-        // Fan control
-        if (currentLine.endsWith("GET /FanOn")) {
-          digitalWrite(fanPin, HIGH);  // Fan ON
-        }
-        if (currentLine.endsWith("GET /FanOff")) {
-          digitalWrite(fanPin, LOW);   // Fan OFF
-        }
-
-        // Light control
-        if (currentLine.endsWith("GET /LightOn")) {
-          digitalWrite(lightPin, HIGH);  // Light ON
-        }
-        if (currentLine.endsWith("GET /LightOff")) {
-          digitalWrite(lightPin, LOW);   // Light OFF
-        }
-
+        if (c == '\n') currentLine = "";
+        else if (c != '\r') currentLine += c;
       }
     }
-
     client.stop();
   }
 }
 
 
-String readLineFromSerial() {
-  String message = "";
-  unsigned long startTime = millis();
-  
-  // Buffer to collect data with timeout
-  while (millis() - startTime < 500) {  // 500ms timeout to receive complete message
-    if (Serial2.available()) {
-      char c = Serial2.read();
-      message += c;
-      
-      // Check if we have a complete JSON message
-      if (c == '\n' || c == '}') {
-        // Make sure we have a properly formatted JSON with all expected fields
-        if (message.indexOf("{") >= 0 && 
-            message.indexOf("}") >= 0 &&
-            message.indexOf("temperature") >= 0 && 
-            message.indexOf("humidity") >= 0 && 
-            message.indexOf("moisture") >= 0 && 
-            message.indexOf("light") >= 0) {
-          
-          // Try to clean up the JSON if needed
-          int startPos = message.indexOf("{");
-          int endPos = message.indexOf("}") + 1;
-          
-          if (startPos >= 0 && endPos > startPos) {
-            // Extract the JSON part only
-            String cleanJson = message.substring(startPos, endPos);
-            Serial.println("Cleaned JSON: " + cleanJson);
-            return cleanJson;
-          }
-        }
-      }
-    }
-    delay(100);  // Small delay to prevent CPU hogging
+void clearSerial2Buffer() {
+  while (Serial2.available()) {
+    Serial2.read();  // Discard bytes
   }
-  
-  Serial.println("Failed to receive complete valid JSON message within timeout");
+}
+
+String readLineFromSerial() {
+  String buffer = "";
+  unsigned long start = millis();
+  clearSerial2Buffer();  //Clear junk before reading
+  const unsigned long timeout = 1000; // 1 sec timeout
+  while (millis() - start < timeout) {
+    while (Serial2.available()) {
+      char c = Serial2.read();
+
+      // Use '#' or '\n' as end-of-message marker
+      if (c == '#') {
+        return buffer;
+      }
+
+      buffer += c;
+    }
+    delay(5);
+  }
+
+  Serial.println("Timeout: Did not receive complete message.");
   return "";
+}
+
+
+void logDataToFirebase() {
+  String moistureAfterValue = moisture_after > 0 ? String(moisture_after) : "null";
+  
+  String fullLog = "{\"" + lastTimestamp + "\": {" +
+    "\"moisture_before\": " + String(moisture) + ", " +
+    "\"temperature\": " + String(temperature) + ", " +
+    "\"humidity\": " + String(humidity) + ", " +
+    "\"light\": " + String(light) + ", " +
+    "\"predicted_time\": " + String(predictedTime) + ", " +
+    "\"moisture_after\": " + moistureAfterValue + "}}";
+
+  logToFirebase("/training_logs", fullLog, true);
 }
 
 void loop() {
   // Always handle web clients in a non-blocking way
   handleClient();
-
-  // digitalWrite(fanPin, HIGH);
-  // delay(1000);  // Wait for 1 second
-  // digitalWrite(fanPin, LOW);
-  // delay(1000);  // Wait for 1 second
-  // digitalWrite(lightPin, HIGH);
-  // delay(1000);  // Wait for 1 second
-  // digitalWrite(lightPin, LOW);
-
   
   // State machine for main program logic
   switch (currentState) {
@@ -307,8 +322,8 @@ void loop() {
         } else {
           lastTimestamp = getFormattedTimeEST();
           
-          // Check if moisture is below or equal to threshold before proceeding
-          if (moisture <= 40) {
+          // Check if moisture is below or equal to threshold before proceeding or autoWateringEnabled is of or on
+          if (autoWateringEnabled && moisture <= 40) {
             predictedTime = callAIPrediction(temperature, humidity, light, moisture);
 
             // Send predicted time to K66F over Serial2
@@ -324,7 +339,12 @@ void loop() {
             
             Serial.println("Moisture level " + String(moisture) + " <= 40, starting watering for " + String(predictedTime) + " seconds");
           } else {
-            Serial.println("Moisture level " + String(moisture) + " > 40, no watering needed");
+                if (!autoWateringEnabled) {
+                  Serial.println("Auto-watering is OFF. Skipping watering even though moisture is low.");
+                }
+                else {
+                  Serial.println("Moisture level " + String(moisture) + " > 40, no watering needed");
+                }
           }
         }
       }
@@ -332,18 +352,25 @@ void loop() {
     break;
       
     case WATERING:
-      // Check if watering time has completed
-      if (millis() >= wateringEndTime) {
-        digitalWrite(5, LOW);
-        Serial.println("Watering complete, waiting for final moisture reading...");
-        currentState = WAITING_FOR_FINAL_READING;
-        stateStartTime = millis();
-        moisture_after = -1; // Reset final moisture reading
-      }
+    // Stop watering immediately if auto-watering is turned OFF mid-process
+    if (!autoWateringEnabled) {
+      Serial.println("Auto-watering turned OFF during watering. Pump won't run after current cycle is complete!");
+      currentState = IDLE;
+      stateStartTime = millis();
+      moisture_after = -1;
       break;
-      
+    }
+
+    // Check if watering time has completed normally
+    if (millis() >= wateringEndTime) {
+      Serial.println("Watering complete, waiting for final moisture reading...");
+      currentState = WAITING_FOR_FINAL_READING;
+      stateStartTime = millis();
+      moisture_after = -1;
+    }
+    break;
     case WAITING_FOR_FINAL_READING:
-      // Wait 1min before trying to get final reading
+      // Wait 1min before trying to get final reading (for demo 1min - This should be 30min)
       if (millis() - stateStartTime >= 60000) {
         // For final moisture reading
         if (Serial2.available()) {
@@ -355,15 +382,12 @@ void loop() {
             if (moisture_after <= 0) {
               Serial.println("Warning: Invalid final moisture reading: " + String(moisture_after));
             }
-            
-            // Log data regardless of validity and return to idle
-            logDataToFirebase();
+            //return to idle
             currentState = IDLE;
           }
         } else if (millis() - stateStartTime >= 30000) {
           // Timeout after waiting long enough, log what we have
           Serial.println("Timeout waiting for moisture reading, moving on without it");
-          logDataToFirebase(); // Log with missing moisture_after
           currentState = IDLE;
         }
       }
@@ -371,18 +395,4 @@ void loop() {
   }
   
   delay(10); // Small delay to prevent CPU hogging
-}
-
-void logDataToFirebase() {
-  String moistureAfterValue = moisture_after > 0 ? String(moisture_after) : "null";
-  
-  String fullLog = "{\"" + lastTimestamp + "\": {" +
-    "\"moisture_before\": " + String(moisture) + ", " +
-    "\"temperature\": " + String(temperature) + ", " +
-    "\"humidity\": " + String(humidity) + ", " +
-    "\"light\": " + String(light) + ", " +
-    "\"predicted_time\": " + String(predictedTime) + ", " +
-    "\"moisture_after\": " + moistureAfterValue + "}}";
-
-  logToFirebase("/training_logs", fullLog, true);
 }
