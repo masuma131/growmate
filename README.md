@@ -64,7 +64,7 @@ This system runs on an **NXP K66F Freedom board**, connected to the following pe
 ---
 
 ## K66F Board Setup
-No additional configuration is required for the NXP K66F Freedom Board beyond uploading the firmware. The board uses standard Mbed libraries and interfaces (AnalogIn, I2C, DigitalOut, and BufferedSerial) directly within the source code.
+This board is programmed using Keil Studio Cloud with standard Mbed libraries (AnalogIn, I2C, DigitalOut, and BufferedSerial). You do not need to install any local IDE or drivers — Keil Studio Cloud runs in your browser and supports direct flashing to the K66F board.
 
 To set up:
 
@@ -81,7 +81,7 @@ No external drivers or bootloader updates are needed.
 
 ## ESP32 Setup
 
-The ESP32 handles AI integration, Firebase logging, offline buffering, and dashboard display.
+This microcontroller is programmed using the Arduino IDE. Ensure you've installed the ESP32 board package before flashing. The ESP32 handles AI integration, Firebase logging, offline buffering, and dashboard display.
 
 ### Prerequisites
 
