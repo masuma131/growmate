@@ -62,6 +62,22 @@ This system runs on an **NXP K66F Freedom board**, connected to the following pe
 
 ---
 
+## K66F Board Setup
+No additional configuration is required for the NXP K66F Freedom Board beyond uploading the firmware. The board uses standard Mbed libraries and interfaces (AnalogIn, I2C, DigitalOut, and BufferedSerial) directly within the source code.
+
+To set up:
+
+- Connect the K66F to your computer via USB  
+- Use **Keil Studio Cloud** to flash the provided `.cpp` file to the board  
+- Ensure the K66F board is selected as the target device  
+- Leave the virtual COM console open to monitor debug logs via `printf()`
+
+All peripherals are configured in code, so once wired correctly, the system will start logging sensor data and listening for ESP32 commands over UART automatically.
+
+No external drivers or bootloader updates are needed.
+
+---
+
 ## ESP32 Setup
 
 The ESP32 handles AI integration, Firebase logging, offline buffering, and dashboard display.
@@ -240,16 +256,6 @@ gcloud functions logs read [FUNCTION_NAME] --region=us-central1
 
 ---
 
-## Contribution Guidelines
-
-1. Use the established data formats  
-2. Maintain consistent feature ordering  
-3. Add tests for new functionality  
-4. Document all changes in the README  
-5. Verify Firebase and GCS permissions before deployment
-
----
-
 ## Troubleshooting
 
 **Common Issues**:
@@ -258,3 +264,14 @@ gcloud functions logs read [FUNCTION_NAME] --region=us-central1
 - **Model loading failures**: Ensure correct GCS bucket path and access  
 - **Prediction mismatches**: Verify consistent feature order between training and prediction  
 - **Function timeouts**: Adjust timeout in `gcloud deploy` as needed
+
+
+## Contributors
+
+This project was developed and maintained by the following team members:
+
+- **Masuma Begum**
+- **Mary-Anne Ibeh**
+- **Chloe Quijano**
+
+Each contributor played a critical role in research, development, testing, and documentation of the GrowMate system.
