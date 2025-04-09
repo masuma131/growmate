@@ -1,47 +1,58 @@
+//Code for the Keil Studio IDE to run on the K66F
+// This code is designed to work with the K66F board and the K66F board.
+
+// ========== Includes & Constants ========== //
 #include "mbed.h"
 #include <cstring>
 using namespace std::chrono;
 
-// Blinking rate in milliseconds
+//-----------------------------------------
+// Configuration & Constants
+//-----------------------------------------
 #define BLINKING_RATE 500ms
 
+//-----------------------------------------
+// Serial Communication (ESP32)
+//-----------------------------------------
 static BufferedSerial serial_port(PTC4, PTC3, 9600);  // UART for ESP32 communication
-
+volatile bool canSendData = true;
 Mutex serial_port_mutex;
-Mutex soilMoistureMutex;
-
+Mutex sendStateMutex;
+//-----------------------------------------
+// Threading
+//-----------------------------------------
 Thread send_data_thread;
 Thread read_data_thread;
-Mutex sendStateMutex;
-//Thread pump_control_thread;
-volatile bool canSendData = true;
 
-// I2C interface for sensors
+//-----------------------------------------
+// I2C Interfaces
+//-----------------------------------------
 I2C i2c1(PTC11, PTC10);
 I2C i2c2(PTB3, PTB2);
 
+//-----------------------------------------
+// I2C Addresses
+//-----------------------------------------
 const int BH1750_ADDR = 0x23 << 1;  // BH1750 (Light Sensor)
 const int SHTC3_ADDR = 0x70 << 1;   // SHTC3 (Temperature & Humidity Sensor)
 
-// Analog input for Soil Moisture Sensor
-AnalogIn soilSensor(PTB7);
-DigitalOut led(LED1);
-DigitalOut fanLED(PTC8);    // LED for fan
-DigitalOut lightLED(PTC16);  // LED for light
+//-----------------------------------------
+// Sensors & Actuators
+//-----------------------------------------
+AnalogIn soilSensor(PTB7);            // Analog pin for soil moisture
+Mutex soilMoistureMutex;              // Mutex to protect soil moisture reading
+DigitalOut fanLED(PTC8);              // LED representing fan control
+DigitalOut lightLED(PTC16);           // LED representing light control
+DigitalOut relayControl(PTA1, 1);     // Relay control for water pump (Active Low)
 
-//Relay
-// Digital output for relay control (PTA1 or any available pin)
-DigitalOut relayControl(PTA1, 1);  // Assuming you are using PTA1 for relay control
-// Threshold for soil moisture to trigger pump
-#define SOIL_MOISTURE_THRESHOLD 40.0  // Below 30% moisture, turn on the pump
-
+//-----------------------------------------
+// Sensor Functions
+//-----------------------------------------
 // Function to read soil moisture level
 float readSoilMoisture() {
     soilMoistureMutex.lock();
     float voltage = soilSensor.read() * 3.3;  // Convert ADC value to voltage
     float moisturePercent = (1 - (voltage / 3.3)) * 100;  // Convert to %
-
-    //printf("Soil Moisture: %.2f%%\n", moisturePercent);
     soilMoistureMutex.unlock();
     return moisturePercent;
 }
@@ -61,7 +72,6 @@ float readLightIntensity() {
     char cmd[2] = {0};
     i2c2.read(BH1750_ADDR, cmd, 2);  // Read 2 bytes of light data
     float lux = ((cmd[0] << 8) | cmd[1]) / 1.2;  // Convert raw data to lux
-    //printf("Light Intensity: %.2f lux\n", lux);
     return lux;
 }
 
@@ -88,12 +98,9 @@ void readSHTC3(float &temperature, float &humidity) {
     // Convert raw data to humidity (%RH)
     int hum_raw = (data[3] << 8) | data[4];
     humidity = (100.0 * hum_raw) / 65535.0;
-
-    //printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
 }
 
-
-// Function to send **real sensor data** to ESP32 in JSON format
+// Function to send sensor data to ESP32 in JSON format
 void send_data() {
     while (true) {
         sendStateMutex.lock();
@@ -116,7 +123,7 @@ void send_data() {
         serial_port.write(jsonData, len);
         serial_port.sync();  // Wait until data is flushed
         serial_port_mutex.unlock();
-        printf("Sent JSON: %s\n", jsonData);
+        //printf("Sent JSON: %s\n", jsonData);
         }
         ThisThread::sleep_for(300ms);
 
@@ -128,7 +135,7 @@ void processCommandFromESP(const char* buffer, uint64_t currentTime, uint64_t &p
     if (waterCmd) {
         float duration = 0;
         if (sscanf(waterCmd, "\"water_duration\": %f", &duration) == 1) {
-            printf("Parsed watering_duration: %.2f seconds\n", duration);
+            //printf("Parsed watering_duration: %.2f seconds\n", duration);
 
             sendStateMutex.lock();
             canSendData = false;
@@ -227,8 +234,8 @@ void read_data() {
 
 
 int main() {
-    initLightSensor();  // Initialize light sensor
-    initSHTC3();        // Initialize SHTC3 sensor
+    initLightSensor();
+    initSHTC3();
     send_data_thread.start(send_data);
     read_data_thread.start(read_data);
 

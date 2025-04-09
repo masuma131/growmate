@@ -1,57 +1,57 @@
+// ========== Includes & Constants ========== //
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#define FIREBASE_SECRET "FIREBASE SECRET"
+#include "secrets.h"
+#include <SPIFFS.h>
 
-// Set this manually based on season
-// -14400 = UTC -4 (EDT), -18000 = UTC -5 (EST)
-#define TIMEZONE_OFFSET -14400  // change to -18000 when DST ends
 
-const char *ssid = "Ihitilan";
-const char *password = "Medhurst78";
-const char *firebase_url = "FIREBASE_URL";
-const char *predict_url = "https://us-central1-growmate-455421.cloudfunctions.net/predict_watering";
-
-WiFiServer server(80);
-WiFiUDP ntpUDP;
-
-// Directly use EST NTP server
-NTPClient timeClient(ntpUDP, "time.nist.gov", TIMEZONE_OFFSET, 60000);
-
+#define TIMEZONE_OFFSET -14400  // change to -18000 when DST ends (Set this manually based on season)
 #define RX2_PIN 16  
 #define TX2_PIN 17  
 #define BAUD_RATE 9600
+#define MAX_LOG_BUFFER 10
+
+//Create a secrets.h file with the following variables:
+// const char *ssid = "your_wifi_ssid";   // WiFi SSID
+// const char *password = "your_wifi_password"; // WiFi Password
+// const char *firebase_url = "https://your_firebase_url/"; // Firebase URL
+// const char *predict_url = "https://us-central1-growmate-455421.cloudfunctions.net/predict_watering"; // AI prediction URL
+// const char *firebase_secret = your_firebase_secret; // Firebase secret key
+
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
+const char *firebase_url = FIREBASE_URL;
+const char *predict_url = PREDICT_URL;
+const char *firebase_secret = FIREBASE_SECRET;
+
+WiFiServer server(80);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "time.nist.gov", TIMEZONE_OFFSET, 60000); //Directly use EST NTP server
 
 const int fanPin = 12;
 const int lightPin = 14;
+bool autoWateringEnabled = true;
 
-bool autoWateringEnabled = true; // Controls whether watering logic runs automatically
-
+// ========== Global State ==========
 unsigned long lastDataUpdate = 0;  //Track last update
 String lastTimestamp = "";
+float temperature = -1, humidity = -1, moisture = -1, light = -1, moisture_after = -1, predictedTime = 0; // -1 indicate not read
 
-// State machine variables
-enum SystemState {
-  IDLE,
-  WATERING,
-  WAITING_FOR_FINAL_READING,
-};
+enum SystemState { IDLE, WATERING, WAITING_FOR_FINAL_READING }; // State machine variables
 
 SystemState currentState = IDLE;
-unsigned long stateStartTime = 0;
-unsigned long wateringEndTime = 0;
+unsigned long stateStartTime = 0, wateringEndTime = 0;
 
-// Store readings
-float temperature = 0;
-float humidity = 0; 
-float moisture = 0;
-float light = 0;
-float moisture_after = -1; // -1 indicates not read yet
-float predictedTime = 0;
+String offlineLogBuffer[MAX_LOG_BUFFER];
+int bufferCount = 0;
+unsigned long lastFlushTime = 0;
 
+
+// ========== Setup ========== //
 void setup() {
-    Serial.begin(9600);
+    Serial.begin(BAUD_RATE);
     Serial2.begin(BAUD_RATE, SERIAL_8N1, RX2_PIN, TX2_PIN);
     Serial.println("\nESP32 is ready to receive data from K66F...");
 
@@ -59,18 +59,31 @@ void setup() {
     pinMode(fanPin, OUTPUT);
     pinMode(lightPin, OUTPUT);
 
+    if (!SPIFFS.begin(true)) {
+      Serial.println("An error has occurred while mounting SPIFFS");
+    } else {
+      Serial.println("SPIFFS mounted successfully");
+    }
+    //clearFile("/offline_logs.txt"); //Debug
+
     Serial.print("Connecting to WiFi: ");
     Serial.println(ssid);
     WiFi.begin(ssid, password);
 
-    while (WiFi.status() != WL_CONNECTED) {
+
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
         delay(500);
         Serial.print(".");
     }
 
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi Connected!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nFailed to connect to WiFi. Continuing in offline mode.");
+    }
 
     timeClient.begin();
     timeClient.update();
@@ -78,6 +91,7 @@ void setup() {
     server.begin();
 }
 
+// ========== Utility Functions ========== //
 // Get formatted EST timestamp using localtime (adjusted by NTPClient)
 String getFormattedTimeEST() {
   timeClient.update();
@@ -100,6 +114,131 @@ float extractValue(String json, String key) {
   return json.substring(start, end).toFloat();
 }
 
+
+void clearSerial2Buffer() {
+  while (Serial2.available()) {
+    Serial2.read();  // Discard bytes
+  }
+}
+
+String readLineFromSerial() {
+  String buffer = "";
+  unsigned long start = millis();
+  clearSerial2Buffer();  //Clear junk before reading
+  const unsigned long timeout = 1000; // 1 sec timeout
+  while (millis() - start < timeout) {
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      // Use '#' as end-of-message marker
+      if (c == '#') {
+        return buffer;
+      }
+
+      buffer += c;
+    }
+    delay(5);
+  }
+
+  Serial.println("Timeout: Did not receive complete message.");
+  return "";
+}
+
+// =================== Data Logging ===================
+void bufferLog(String jsonData) {
+  File file = SPIFFS.open("/offline_logs.txt", FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open log file for appending");
+    return;
+  }
+  file.println(jsonData);
+  file.close();
+  Serial.println("Log buffered to file.");
+}
+
+void printBufferedLogs() {
+  File file = SPIFFS.open("/offline_logs.txt", FILE_READ);
+  if (!file || file.size() == 0) {
+    Serial.println("No buffered logs found.");
+    file.close();
+    return;
+  }
+
+  Serial.println("=== Buffered Logs Start ===");
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    Serial.println(line);
+  }
+  Serial.println("=== Buffered Logs End ===");
+  file.close();
+}
+
+void clearFile(const char* filename) {
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (file) {
+    file.close();  // Opening in write mode automatically clears it
+    Serial.println(String(filename) + " cleared.");
+  } else {
+    Serial.println("Failed to open " + String(filename));
+  }
+}
+
+void logDataToFirebaseOrBuffer(String path, String jsonData, bool patch = false) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected. Cannot log to Firebase.");
+    Serial.println("Logged to buffer");
+    bufferLog(jsonData); // Buffer instead of posting
+    return;
+  }
+  HTTPClient http;
+  String full_url = String(firebase_url) + path + ".json?auth=" + firebase_secret;
+  http.begin(full_url);
+  http.addHeader("Content-Type", "application/json");
+  int code = patch ? http.PATCH(jsonData) : http.PUT(jsonData);
+  Serial.println(code == 200 ? "Logged to Firebase!" : "Firebase log error: " + String(code));
+  http.end();
+}
+
+void logDataToFirebase() {
+  String moistureAfterValue = moisture_after > 0 ? String(moisture_after) : "null";
+  
+  String fullLog = "{\"" + lastTimestamp + "\": {" +
+    "\"moisture_before\": " + String(moisture) + ", " +
+    "\"temperature\": " + String(temperature) + ", " +
+    "\"humidity\": " + String(humidity) + ", " +
+    "\"light\": " + String(light) + ", " +
+    "\"predicted_time\": " + String(predictedTime) + ", " +
+    "\"moisture_after\": " + moistureAfterValue + "}}";
+
+  logDataToFirebaseOrBuffer("/training_logs", fullLog, true);
+}
+
+void flushBufferedLogs() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  File file = SPIFFS.open("/offline_logs.txt", FILE_READ);
+  if (!file || file.size() == 0) {
+    file.close();
+    return;
+  }
+
+  Serial.println("Flushing buffered logs from file...");
+
+  while (file.available()) {
+    String logLine = file.readStringUntil('\n');
+    logDataToFirebaseOrBuffer("/training_logs", logLine, true);
+    delay(500); // Give time between requests
+  }
+  file.close();
+
+  // Clear the file after flushing
+  File clearFile = SPIFFS.open("/offline_logs.txt", FILE_WRITE);
+  if (clearFile) clearFile.close();
+
+  Serial.println("All buffered logs flushed and file cleared.");
+}
+
+
+// =================== AI Prediction ===================
 float callAIPrediction(float temp, float humidity, float light, float moisture_before) {
     HTTPClient http;
     http.begin(predict_url);
@@ -125,21 +264,7 @@ float callAIPrediction(float temp, float humidity, float light, float moisture_b
     return duration;
 }
 
-void logToFirebase(String path, String jsonData, bool patch = false) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected. Cannot log to Firebase.");
-    return;
-  }
-  
-  HTTPClient http;
-  String full_url = String(firebase_url) + path + ".json?auth=" + FIREBASE_SECRET;
-  http.begin(full_url);
-  http.addHeader("Content-Type", "application/json");
-  int code = patch ? http.PATCH(jsonData) : http.PUT(jsonData);
-  Serial.println(code == 200 ? "Logged to Firebase!" : "Firebase log error: " + String(code));
-  http.end();
-}
-
+// ========== Web Dashboard ========== //
 void handleClient() {
   WiFiClient client = server.available();
 
@@ -244,55 +369,14 @@ void handleClient() {
   }
 }
 
-
-void clearSerial2Buffer() {
-  while (Serial2.available()) {
-    Serial2.read();  // Discard bytes
-  }
-}
-
-String readLineFromSerial() {
-  String buffer = "";
-  unsigned long start = millis();
-  clearSerial2Buffer();  //Clear junk before reading
-  const unsigned long timeout = 1000; // 1 sec timeout
-  while (millis() - start < timeout) {
-    while (Serial2.available()) {
-      char c = Serial2.read();
-
-      // Use '#' or '\n' as end-of-message marker
-      if (c == '#') {
-        return buffer;
-      }
-
-      buffer += c;
-    }
-    delay(5);
-  }
-
-  Serial.println("Timeout: Did not receive complete message.");
-  return "";
-}
-
-
-void logDataToFirebase() {
-  String moistureAfterValue = moisture_after > 0 ? String(moisture_after) : "null";
-  
-  String fullLog = "{\"" + lastTimestamp + "\": {" +
-    "\"moisture_before\": " + String(moisture) + ", " +
-    "\"temperature\": " + String(temperature) + ", " +
-    "\"humidity\": " + String(humidity) + ", " +
-    "\"light\": " + String(light) + ", " +
-    "\"predicted_time\": " + String(predictedTime) + ", " +
-    "\"moisture_after\": " + moistureAfterValue + "}}";
-
-  logToFirebase("/training_logs", fullLog, true);
-}
-
+// =================== Main Loop ===================
 void loop() {
+    if (millis() - lastFlushTime > 10000) { // every 10 seconds
+    flushBufferedLogs();
+    lastFlushTime = millis();
+  }
   // Always handle web clients in a non-blocking way
   handleClient();
-  
   // State machine for main program logic
   switch (currentState) {
   case IDLE:
@@ -316,29 +400,26 @@ void loop() {
         Serial.println("Moisture: " + String(moisture));
         Serial.println("Light: " + String(light));
 
-        // Simple validation - if any reading is nan, don't proceed
-        if (isnan(temperature) || isnan(humidity) || isnan(moisture) || isnan(light)) {
-          Serial.println("Warning: Some sensor readings are invalid, staying in IDLE state");
+        // Simple validation - if any reading is -1, don't proceed
+        if (temperature < 0 || humidity < 0 || moisture < 0 || light < 0) {
+        Serial.println("Warning: Some sensor readings are invalid (< 0), staying in IDLE state");
         } else {
           lastTimestamp = getFormattedTimeEST();
           
           // Check if moisture is below or equal to threshold before proceeding or autoWateringEnabled is of or on
           if (autoWateringEnabled && moisture <= 40) {
             predictedTime = callAIPrediction(temperature, humidity, light, moisture);
-
+            
             // Send predicted time to K66F over Serial2
             String durationCmd = "{\"water_duration\": " + String(predictedTime) + "}\n";
             Serial2.print(durationCmd);
+            Serial.println("Moisture level " + String(moisture) + " <= 40, starting watering for " + String(predictedTime) + " seconds");
             Serial.println("Sent to K66F: " + durationCmd);
-            
             // Move to watering state
-            digitalWrite(5, HIGH);
             currentState = WATERING;
             stateStartTime = millis();
             wateringEndTime = stateStartTime + (predictedTime * 1000);
-            
-            Serial.println("Moisture level " + String(moisture) + " <= 40, starting watering for " + String(predictedTime) + " seconds");
-          } else {
+                      } else {
                 if (!autoWateringEnabled) {
                   Serial.println("Auto-watering is OFF. Skipping watering even though moisture is low.");
                 }
@@ -360,7 +441,6 @@ void loop() {
       moisture_after = -1;
       break;
     }
-
     // Check if watering time has completed normally
     if (millis() >= wateringEndTime) {
       Serial.println("Watering complete, waiting for final moisture reading...");
@@ -370,8 +450,8 @@ void loop() {
     }
     break;
     case WAITING_FOR_FINAL_READING:
-      // Wait 1min before trying to get final reading (for demo 1min - This should be 30min)
-      if (millis() - stateStartTime >= 60000) {
+      // Wait 1min before trying to get final reading (for demo 30min - This should be 30min)
+      if (millis() - stateStartTime >= 30000) {
         // For final moisture reading
         if (Serial2.available()) {
           String moistureUpdate = readLineFromSerial();
@@ -382,7 +462,10 @@ void loop() {
             if (moisture_after <= 0) {
               Serial.println("Warning: Invalid final moisture reading: " + String(moisture_after));
             }
-            //return to idle
+            printBufferedLogs(); //Debug
+            logDataToFirebase();
+
+            //return to idle          
             currentState = IDLE;
           }
         } else if (millis() - stateStartTime >= 30000) {
