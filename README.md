@@ -9,6 +9,7 @@ This project implements an intelligent, automated watering system that:
 2. Continuously learns from watering outcomes  
 3. Maintains optimal soil moisture (target: 50%)
 
+### System Data Flow Diagram
 ![GrowMate System](./images/data-flow-diagram.png)
 
 ---
